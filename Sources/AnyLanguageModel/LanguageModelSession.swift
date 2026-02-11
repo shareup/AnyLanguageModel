@@ -136,8 +136,11 @@ public final class LanguageModelSession: @unchecked Sendable {
                     }
                     continuation.finish()
 
-                    // Add response to transcript after stream completes
+                    // Add tool call/output entries and response to transcript after stream completes
                     if let lastSnapshot {
+                        // Append any tool call and tool output entries accumulated during streaming
+                        let toolEntries = lastSnapshot.transcriptEntries
+
                         // Extract text content from the generated content
                         let textContent: String
                         if case .string(let str) = lastSnapshot.rawContent.kind {
@@ -153,6 +156,9 @@ public final class LanguageModelSession: @unchecked Sendable {
                             )
                         )
                         await MainActor.run {
+                            for entry in toolEntries {
+                                session.transcript.append(entry)
+                            }
                             session.transcript.append(responseEntry)
                         }
                     }
@@ -803,6 +809,7 @@ extension LanguageModelSession {
         public struct Snapshot: Sendable where Content.PartiallyGenerated: Sendable {
             public var content: Content.PartiallyGenerated
             public var rawContent: GeneratedContent
+            var transcriptEntries: [Transcript.Entry] = []
 
             /// Creates a snapshot from partially generated content and raw content.
             /// - Parameters:
@@ -873,7 +880,7 @@ extension LanguageModelSession.ResponseStream: AsyncSequence {
                 return LanguageModelSession.Response(
                     content: finalContent,
                     rawContent: last.rawContent,
-                    transcriptEntries: []
+                    transcriptEntries: ArraySlice(last.transcriptEntries)
                 )
             }
         }
