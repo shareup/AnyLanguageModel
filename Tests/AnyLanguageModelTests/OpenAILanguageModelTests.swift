@@ -585,3 +585,963 @@ private func withOpenAIRateLimitRetry<T>(
         }
     }
 }
+
+// MARK: - Streaming Tool Call Tests (mocked)
+
+@Suite("OpenAI streaming tool calls (mocked)", .serialized)
+struct OpenAIStreamingToolCallTests {
+    private let baseURL = URL(string: "https://mock-openai-streaming.local")!
+
+    @Test func responsesStreamToolCallExecution() async throws {
+        var requestCount = 0
+        MockSSEURLProtocol.handler = { request in
+            defer { requestCount += 1 }
+            if requestCount == 0 {
+                // First request: model returns a tool call
+                return [
+                    sseEvent(
+                        #"{"type":"response.tool_call.created","tool_call":{"id":"call_1","type":"function","function":{"name":"getWeather","arguments":""}}}"#
+                    ),
+                    sseEvent(
+                        #"{"type":"response.tool_call.delta","tool_call":{"id":"call_1","function":{"arguments":"{\"city\":\"San Francisco\"}"}}}"#
+                    ),
+                    sseEvent(#"{"type":"response.completed","finish_reason":"tool_calls"}"#),
+                ]
+            } else {
+                // Second request: model returns text after tool results
+                return [
+                    sseEvent(#"{"type":"response.output_text.delta","delta":"Sunny and 72°F."}"#),
+                    sseEvent(#"{"type":"response.completed","finish_reason":"stop"}"#),
+                ]
+            }
+        }
+        defer { MockSSEURLProtocol.handler = nil }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockSSEURLProtocol.self]
+
+        let model = OpenAILanguageModel(
+            baseURL: baseURL,
+            apiKey: "test-key",
+            model: "gpt-test",
+            apiVariant: .responses,
+            session: URLSession(configuration: config)
+        )
+        let session = LanguageModelSession(model: model, tools: [WeatherTool()])
+
+        var snapshots: [LanguageModelSession.ResponseStream<String>.Snapshot] = []
+        for try await snapshot in session.streamResponse(to: "What's the weather?") {
+            snapshots.append(snapshot)
+        }
+
+        // Should have made 2 requests (tool call + continuation)
+        #expect(requestCount == 2)
+        #expect(!snapshots.isEmpty)
+
+        // Final snapshot should have the text response
+        let final = snapshots.last!
+        #expect(final.rawContent.jsonString.contains("Sunny"))
+
+        // The last snapshot's transcript entries should include tool call and output
+        var hasToolCalls = false
+        var hasToolOutput = false
+        for entry in final.transcriptEntries {
+            if case .toolCalls = entry { hasToolCalls = true }
+            if case .toolOutput = entry { hasToolOutput = true }
+        }
+        #expect(hasToolCalls)
+        #expect(hasToolOutput)
+    }
+
+    @Test func chatCompletionsStreamToolCallExecution() async throws {
+        var requestCount = 0
+        MockSSEURLProtocol.handler = { request in
+            defer { requestCount += 1 }
+            if requestCount == 0 {
+                // First request: model returns tool call deltas
+                return [
+                    sseEvent(
+                        #"{"id":"evt_1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"getWeather","arguments":""}}]},"finish_reason":null}]}"#
+                    ),
+                    sseEvent(
+                        #"{"id":"evt_1","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":"}}]},"finish_reason":null}]}"#
+                    ),
+                    sseEvent(
+                        #"{"id":"evt_1","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Paris\"}"}}]},"finish_reason":null}]}"#
+                    ),
+                    sseEvent(#"{"id":"evt_1","choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#),
+                ]
+            } else {
+                // Second request: model returns text after tool results
+                return [
+                    sseEvent(
+                        #"{"id":"evt_2","choices":[{"delta":{"content":"Paris is sunny."},"finish_reason":null}]}"#
+                    ),
+                    sseEvent(#"{"id":"evt_2","choices":[{"delta":{},"finish_reason":"stop"}]}"#),
+                ]
+            }
+        }
+        defer { MockSSEURLProtocol.handler = nil }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockSSEURLProtocol.self]
+
+        let model = OpenAILanguageModel(
+            baseURL: baseURL,
+            apiKey: "test-key",
+            model: "gpt-test",
+            apiVariant: .chatCompletions,
+            session: URLSession(configuration: config)
+        )
+        let session = LanguageModelSession(model: model, tools: [WeatherTool()])
+
+        var snapshots: [LanguageModelSession.ResponseStream<String>.Snapshot] = []
+        for try await snapshot in session.streamResponse(to: "What's the weather in Paris?") {
+            snapshots.append(snapshot)
+        }
+
+        // Should have made 2 requests (tool call + continuation)
+        #expect(requestCount == 2)
+        #expect(!snapshots.isEmpty)
+
+        // Final snapshot should have the text response
+        let final = snapshots.last!
+        #expect(final.rawContent.jsonString.contains("Paris"))
+    }
+
+    @Test func streamingToolCallsAppearInTranscriptEntries() async throws {
+        var requestCount = 0
+        MockSSEURLProtocol.handler = { request in
+            defer { requestCount += 1 }
+            if requestCount == 0 {
+                return [
+                    sseEvent(
+                        #"{"id":"evt_1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"getWeather","arguments":"{\"city\":\"London\"}"}}]},"finish_reason":null}]}"#
+                    ),
+                    sseEvent(#"{"id":"evt_1","choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#),
+                ]
+            } else {
+                return [
+                    sseEvent(
+                        #"{"id":"evt_2","choices":[{"delta":{"content":"London weather: sunny."},"finish_reason":null}]}"#
+                    ),
+                    sseEvent(#"{"id":"evt_2","choices":[{"delta":{},"finish_reason":"stop"}]}"#),
+                ]
+            }
+        }
+        defer { MockSSEURLProtocol.handler = nil }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockSSEURLProtocol.self]
+
+        let model = OpenAILanguageModel(
+            baseURL: baseURL,
+            apiKey: "test-key",
+            model: "gpt-test",
+            apiVariant: .chatCompletions,
+            session: URLSession(configuration: config)
+        )
+        let session = LanguageModelSession(model: model, tools: [WeatherTool()])
+
+        let response = try await session.streamResponse(
+            to: "What's the weather in London?"
+        ).collect()
+
+        // The response should include transcript entries for tool calls and outputs
+        var hasToolCalls = false
+        var hasToolOutput = false
+        for entry in response.transcriptEntries {
+            if case .toolCalls(let calls) = entry {
+                hasToolCalls = true
+                #expect(calls.first?.toolName == "getWeather")
+            }
+            if case .toolOutput(let output) = entry {
+                hasToolOutput = true
+                #expect(output.toolName == "getWeather")
+            }
+        }
+        #expect(hasToolCalls)
+        #expect(hasToolOutput)
+        #expect(response.content.contains("London"))
+    }
+
+    @Test func streamingWithToolExecutionDelegateStop() async throws {
+        var requestCount = 0
+        MockSSEURLProtocol.handler = { request in
+            defer { requestCount += 1 }
+            return [
+                sseEvent(
+                    #"{"id":"evt_1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"getWeather","arguments":"{\"city\":\"Berlin\"}"}}]},"finish_reason":null}]}"#
+                ),
+                sseEvent(#"{"id":"evt_1","choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#),
+            ]
+        }
+        defer { MockSSEURLProtocol.handler = nil }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockSSEURLProtocol.self]
+
+        let model = OpenAILanguageModel(
+            baseURL: baseURL,
+            apiKey: "test-key",
+            model: "gpt-test",
+            apiVariant: .chatCompletions,
+            session: URLSession(configuration: config)
+        )
+        let session = LanguageModelSession(model: model, tools: [WeatherTool()])
+        session.toolExecutionDelegate = StopDelegate()
+
+        let response = try await session.streamResponse(
+            to: "What's the weather?"
+        ).collect()
+
+        // With stop delegate, only 1 request should be made (no continuation)
+        #expect(requestCount == 1)
+
+        // Tool calls should be in transcript entries, but no tool output
+        var hasToolCalls = false
+        var hasToolOutput = false
+        for entry in response.transcriptEntries {
+            if case .toolCalls = entry { hasToolCalls = true }
+            if case .toolOutput = entry { hasToolOutput = true }
+        }
+        #expect(hasToolCalls)
+        #expect(!hasToolOutput)
+    }
+
+    // MARK: - Multiple parallel tool calls
+
+    @Test func multipleParallelToolCalls() async throws {
+        var requestCount = 0
+        MockSSEURLProtocol.handler = { request in
+            defer { requestCount += 1 }
+            if requestCount == 0 {
+                // Model calls both getWeather and calculate in parallel
+                return [
+                    sseEvent(
+                        #"{"id":"evt_1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"getWeather","arguments":"{\"city\":\"Tokyo\"}"}}]},"finish_reason":null}]}"#
+                    ),
+                    sseEvent(
+                        #"{"id":"evt_1","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_2","type":"function","function":{"name":"calculate","arguments":"{\"expression\":\"2+2\"}"}}]},"finish_reason":null}]}"#
+                    ),
+                    sseEvent(#"{"id":"evt_1","choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#),
+                ]
+            } else {
+                return [
+                    sseEvent(
+                        #"{"id":"evt_2","choices":[{"delta":{"content":"Tokyo is sunny. 2+2=4."},"finish_reason":null}]}"#
+                    ),
+                    sseEvent(#"{"id":"evt_2","choices":[{"delta":{},"finish_reason":"stop"}]}"#),
+                ]
+            }
+        }
+        defer { MockSSEURLProtocol.handler = nil }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockSSEURLProtocol.self]
+
+        let model = OpenAILanguageModel(
+            baseURL: baseURL,
+            apiKey: "test-key",
+            model: "gpt-test",
+            apiVariant: .chatCompletions,
+            session: URLSession(configuration: config)
+        )
+        let session = LanguageModelSession(
+            model: model,
+            tools: [WeatherTool(), CalculateTool()]
+        )
+
+        let response = try await session.streamResponse(
+            to: "What's the weather in Tokyo and what's 2+2?"
+        ).collect()
+
+        #expect(requestCount == 2)
+        #expect(response.content.contains("Tokyo"))
+
+        // Should have one toolCalls entry with both calls, plus two toolOutput entries
+        var toolCallEntries: [Transcript.ToolCalls] = []
+        var toolOutputEntries: [Transcript.ToolOutput] = []
+        for entry in response.transcriptEntries {
+            if case .toolCalls(let calls) = entry { toolCallEntries.append(calls) }
+            if case .toolOutput(let output) = entry { toolOutputEntries.append(output) }
+        }
+        #expect(toolCallEntries.count == 1)
+        #expect(toolCallEntries.first!.count == 2)
+        #expect(toolOutputEntries.count == 2)
+
+        let toolNames = Set(toolOutputEntries.map(\.toolName))
+        #expect(toolNames.contains("getWeather"))
+        #expect(toolNames.contains("calculate"))
+    }
+
+    // MARK: - Multiple rounds of tool calling
+
+    @Test func multipleRoundsOfToolCalling() async throws {
+        var requestCount = 0
+        MockSSEURLProtocol.handler = { request in
+            defer { requestCount += 1 }
+            if requestCount == 0 {
+                // First round: model calls getWeather for Tokyo
+                return [
+                    sseEvent(
+                        #"{"id":"evt_1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"getWeather","arguments":"{\"city\":\"Tokyo\"}"}}]},"finish_reason":null}]}"#
+                    ),
+                    sseEvent(#"{"id":"evt_1","choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#),
+                ]
+            } else if requestCount == 1 {
+                // Second round: model calls getWeather for London
+                return [
+                    sseEvent(
+                        #"{"id":"evt_2","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_2","type":"function","function":{"name":"getWeather","arguments":"{\"city\":\"London\"}"}}]},"finish_reason":null}]}"#
+                    ),
+                    sseEvent(#"{"id":"evt_2","choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#),
+                ]
+            } else {
+                // Third request: model returns final text
+                return [
+                    sseEvent(
+                        #"{"id":"evt_3","choices":[{"delta":{"content":"Tokyo and London are both sunny."},"finish_reason":null}]}"#
+                    ),
+                    sseEvent(#"{"id":"evt_3","choices":[{"delta":{},"finish_reason":"stop"}]}"#),
+                ]
+            }
+        }
+        defer { MockSSEURLProtocol.handler = nil }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockSSEURLProtocol.self]
+
+        let model = OpenAILanguageModel(
+            baseURL: baseURL,
+            apiKey: "test-key",
+            model: "gpt-test",
+            apiVariant: .chatCompletions,
+            session: URLSession(configuration: config)
+        )
+        let session = LanguageModelSession(model: model, tools: [WeatherTool()])
+
+        let response = try await session.streamResponse(
+            to: "Compare weather in Tokyo and London"
+        ).collect()
+
+        #expect(requestCount == 3)
+        #expect(response.content.contains("Tokyo"))
+        #expect(response.content.contains("London"))
+
+        // Should have two toolCalls entries and two toolOutput entries
+        var toolCallEntries: [Transcript.ToolCalls] = []
+        var toolOutputEntries: [Transcript.ToolOutput] = []
+        for entry in response.transcriptEntries {
+            if case .toolCalls(let calls) = entry { toolCallEntries.append(calls) }
+            if case .toolOutput(let output) = entry { toolOutputEntries.append(output) }
+        }
+        #expect(toolCallEntries.count == 2)
+        #expect(toolOutputEntries.count == 2)
+    }
+
+    // MARK: - provideOutput delegate
+
+    @Test func streamingWithProvideOutputDelegate() async throws {
+        var requestCount = 0
+        MockSSEURLProtocol.handler = { request in
+            defer { requestCount += 1 }
+            if requestCount == 0 {
+                return [
+                    sseEvent(
+                        #"{"id":"evt_1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"getWeather","arguments":"{\"city\":\"Rome\"}"}}]},"finish_reason":null}]}"#
+                    ),
+                    sseEvent(#"{"id":"evt_1","choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#),
+                ]
+            } else {
+                return [
+                    sseEvent(
+                        #"{"id":"evt_2","choices":[{"delta":{"content":"Custom output was used."},"finish_reason":null}]}"#
+                    ),
+                    sseEvent(#"{"id":"evt_2","choices":[{"delta":{},"finish_reason":"stop"}]}"#),
+                ]
+            }
+        }
+        defer { MockSSEURLProtocol.handler = nil }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockSSEURLProtocol.self]
+
+        let model = OpenAILanguageModel(
+            baseURL: baseURL,
+            apiKey: "test-key",
+            model: "gpt-test",
+            apiVariant: .chatCompletions,
+            session: URLSession(configuration: config)
+        )
+        let weatherSpy = spy(on: WeatherTool())
+        let session = LanguageModelSession(model: model, tools: [weatherSpy])
+        session.toolExecutionDelegate = ProvideOutputDelegate(
+            output: [.text(.init(content: "Stubbed: rainy in Rome"))]
+        )
+
+        let response = try await session.streamResponse(
+            to: "What's the weather in Rome?"
+        ).collect()
+
+        // Should have made 2 requests (tool call with provided output + continuation)
+        #expect(requestCount == 2)
+
+        // The actual WeatherTool should NOT have been called
+        let calls = await weatherSpy.calls
+        #expect(calls.isEmpty)
+
+        // Transcript entries should contain the provided output
+        var foundProvidedOutput = false
+        for entry in response.transcriptEntries {
+            if case .toolOutput(let output) = entry {
+                let text = output.segments.compactMap { seg -> String? in
+                    if case .text(let t) = seg { return t.content }
+                    return nil
+                }.joined()
+                if text.contains("Stubbed: rainy in Rome") {
+                    foundProvidedOutput = true
+                }
+            }
+        }
+        #expect(foundProvidedOutput)
+    }
+
+    // MARK: - Tool not found
+
+    @Test func streamingWithUnknownToolContinues() async throws {
+        var requestCount = 0
+        MockSSEURLProtocol.handler = { request in
+            defer { requestCount += 1 }
+            if requestCount == 0 {
+                // Model calls a tool that doesn't exist
+                return [
+                    sseEvent(
+                        #"{"id":"evt_1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"nonExistentTool","arguments":"{}"}}]},"finish_reason":null}]}"#
+                    ),
+                    sseEvent(#"{"id":"evt_1","choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#),
+                ]
+            } else {
+                // Model still responds after getting "tool not found" output
+                return [
+                    sseEvent(
+                        #"{"id":"evt_2","choices":[{"delta":{"content":"I couldn't find that tool."},"finish_reason":null}]}"#
+                    ),
+                    sseEvent(#"{"id":"evt_2","choices":[{"delta":{},"finish_reason":"stop"}]}"#),
+                ]
+            }
+        }
+        defer { MockSSEURLProtocol.handler = nil }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockSSEURLProtocol.self]
+
+        let model = OpenAILanguageModel(
+            baseURL: baseURL,
+            apiKey: "test-key",
+            model: "gpt-test",
+            apiVariant: .chatCompletions,
+            session: URLSession(configuration: config)
+        )
+        let session = LanguageModelSession(model: model, tools: [WeatherTool()])
+
+        let response = try await session.streamResponse(
+            to: "Use the nonExistentTool"
+        ).collect()
+
+        // Should still complete: 2 requests (tool not found → continuation)
+        #expect(requestCount == 2)
+        #expect(response.content.contains("couldn't find"))
+
+        // Tool output should contain the "not found" message
+        var foundNotFound = false
+        for entry in response.transcriptEntries {
+            if case .toolOutput(let output) = entry {
+                let text = output.segments.compactMap { seg -> String? in
+                    if case .text(let t) = seg { return t.content }
+                    return nil
+                }.joined()
+                if text.contains("Tool not found") {
+                    foundNotFound = true
+                }
+            }
+        }
+        #expect(foundNotFound)
+    }
+
+    // MARK: - Tool execution failure
+
+    @Test func streamingToolExecutionFailureThrows() async throws {
+        MockSSEURLProtocol.handler = { request in
+            [
+                sseEvent(
+                    #"{"id":"evt_1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"failingTool","arguments":"{\"input\":\"fail\"}"}}]},"finish_reason":null}]}"#
+                ),
+                sseEvent(#"{"id":"evt_1","choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#),
+            ]
+        }
+        defer { MockSSEURLProtocol.handler = nil }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockSSEURLProtocol.self]
+
+        let model = OpenAILanguageModel(
+            baseURL: baseURL,
+            apiKey: "test-key",
+            model: "gpt-test",
+            apiVariant: .chatCompletions,
+            session: URLSession(configuration: config)
+        )
+        let session = LanguageModelSession(model: model, tools: [FailingTool()])
+
+        do {
+            _ = try await session.streamResponse(
+                to: "Call the failing tool"
+            ).collect()
+            Issue.record("Expected ToolCallError to be thrown")
+        } catch let error as LanguageModelSession.ToolCallError {
+            #expect(error.tool.name == "failingTool")
+            #expect(error.underlyingError is FailingToolError)
+        }
+    }
+
+    // MARK: - Structured output with tool calls
+
+    @Test func structuredOutputWithToolCallsResponses() async throws {
+        var requestCount = 0
+        MockSSEURLProtocol.handler = { request in
+            defer { requestCount += 1 }
+            if requestCount == 0 {
+                return [
+                    sseEvent(
+                        #"{"type":"response.tool_call.created","tool_call":{"id":"call_1","type":"function","function":{"name":"getWeather","arguments":""}}}"#
+                    ),
+                    sseEvent(
+                        #"{"type":"response.tool_call.delta","tool_call":{"id":"call_1","function":{"arguments":"{\"city\":\"Denver\"}"}}}"#
+                    ),
+                    sseEvent(#"{"type":"response.completed","finish_reason":"tool_calls"}"#),
+                ]
+            } else {
+                // Return JSON for structured output
+                return [
+                    sseEvent(
+                        #"{"type":"response.output_text.delta","delta":"{\"city\":"}"#
+                    ),
+                    sseEvent(
+                        #"{"type":"response.output_text.delta","delta":"\"Denver\",\"temperature\":72}"}"#
+                    ),
+                    sseEvent(#"{"type":"response.completed","finish_reason":"stop"}"#),
+                ]
+            }
+        }
+        defer { MockSSEURLProtocol.handler = nil }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockSSEURLProtocol.self]
+
+        let model = OpenAILanguageModel(
+            baseURL: baseURL,
+            apiKey: "test-key",
+            model: "gpt-test",
+            apiVariant: .responses,
+            session: URLSession(configuration: config)
+        )
+        let session = LanguageModelSession(model: model, tools: [WeatherTool()])
+
+        var snapshots: [LanguageModelSession.ResponseStream<CityWeather>.Snapshot] = []
+        for try await snapshot in session.streamResponse(
+            to: "Get the weather in Denver",
+            generating: CityWeather.self
+        ) {
+            snapshots.append(snapshot)
+        }
+
+        #expect(requestCount == 2)
+        #expect(!snapshots.isEmpty)
+
+        // The last snapshot should have parseable structured content
+        let last = snapshots.last!
+        #expect(last.content.city == "Denver")
+        #expect(last.content.temperature == 72)
+
+        // Should have tool entries
+        var hasToolCalls = false
+        for entry in last.transcriptEntries {
+            if case .toolCalls = entry { hasToolCalls = true }
+        }
+        #expect(hasToolCalls)
+    }
+
+    // MARK: - Empty accumulator with tool_calls finish reason
+
+    @Test func finishReasonToolCallsWithEmptyAccumulator() async throws {
+        var requestCount = 0
+        MockSSEURLProtocol.handler = { request in
+            defer { requestCount += 1 }
+            // Model says finish_reason is "tool_calls" but never sent any tool call deltas
+            return [
+                sseEvent(
+                    #"{"id":"evt_1","choices":[{"delta":{"content":"Some text"},"finish_reason":null}]}"#
+                ),
+                sseEvent(#"{"id":"evt_1","choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#),
+            ]
+        }
+        defer { MockSSEURLProtocol.handler = nil }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockSSEURLProtocol.self]
+
+        let model = OpenAILanguageModel(
+            baseURL: baseURL,
+            apiKey: "test-key",
+            model: "gpt-test",
+            apiVariant: .chatCompletions,
+            session: URLSession(configuration: config)
+        )
+        let session = LanguageModelSession(model: model, tools: [WeatherTool()])
+
+        let response = try await session.streamResponse(
+            to: "Test edge case"
+        ).collect()
+
+        // Should only make 1 request — the guard breaks out of the loop
+        #expect(requestCount == 1)
+        // Should still have the text content
+        #expect(response.content.contains("Some text"))
+    }
+
+    // MARK: - Text mixed with tool calls in same response
+
+    @Test func textContentMixedWithToolCalls() async throws {
+        var requestCount = 0
+        MockSSEURLProtocol.handler = { request in
+            defer { requestCount += 1 }
+            if requestCount == 0 {
+                // Model sends some text before deciding to call a tool
+                return [
+                    sseEvent(
+                        #"{"id":"evt_1","choices":[{"delta":{"content":"Let me check"},"finish_reason":null}]}"#
+                    ),
+                    sseEvent(
+                        #"{"id":"evt_1","choices":[{"delta":{"content":" the weather."},"finish_reason":null}]}"#
+                    ),
+                    sseEvent(
+                        #"{"id":"evt_1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"getWeather","arguments":"{\"city\":\"Miami\"}"}}]},"finish_reason":null}]}"#
+                    ),
+                    sseEvent(#"{"id":"evt_1","choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#),
+                ]
+            } else {
+                return [
+                    sseEvent(
+                        #"{"id":"evt_2","choices":[{"delta":{"content":"Miami is sunny and 85°F."},"finish_reason":null}]}"#
+                    ),
+                    sseEvent(#"{"id":"evt_2","choices":[{"delta":{},"finish_reason":"stop"}]}"#),
+                ]
+            }
+        }
+        defer { MockSSEURLProtocol.handler = nil }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockSSEURLProtocol.self]
+
+        let model = OpenAILanguageModel(
+            baseURL: baseURL,
+            apiKey: "test-key",
+            model: "gpt-test",
+            apiVariant: .chatCompletions,
+            session: URLSession(configuration: config)
+        )
+        let session = LanguageModelSession(model: model, tools: [WeatherTool()])
+
+        var snapshots: [LanguageModelSession.ResponseStream<String>.Snapshot] = []
+        for try await snapshot in session.streamResponse(to: "How's Miami?") {
+            snapshots.append(snapshot)
+        }
+
+        #expect(requestCount == 2)
+
+        // Text snapshots from the first request should have been yielded
+        let textBeforeTools = snapshots.first { snap in
+            snap.rawContent.jsonString.contains("Let me check")
+        }
+        #expect(textBeforeTools != nil)
+
+        // Final response should contain the continuation text
+        let final = snapshots.last!
+        #expect(final.rawContent.jsonString.contains("Miami is sunny"))
+    }
+
+    // MARK: - Session transcript state after wrapStream completes
+
+    @Test func sessionTranscriptContainsToolEntriesAfterStreaming() async throws {
+        var requestCount = 0
+        MockSSEURLProtocol.handler = { request in
+            defer { requestCount += 1 }
+            if requestCount == 0 {
+                return [
+                    sseEvent(
+                        #"{"type":"response.tool_call.created","tool_call":{"id":"call_1","type":"function","function":{"name":"getWeather","arguments":""}}}"#
+                    ),
+                    sseEvent(
+                        #"{"type":"response.tool_call.delta","tool_call":{"id":"call_1","function":{"arguments":"{\"city\":\"Seattle\"}"}}}"#
+                    ),
+                    sseEvent(#"{"type":"response.completed","finish_reason":"tool_calls"}"#),
+                ]
+            } else {
+                return [
+                    sseEvent(#"{"type":"response.output_text.delta","delta":"Seattle is rainy."}"#),
+                    sseEvent(#"{"type":"response.completed","finish_reason":"stop"}"#),
+                ]
+            }
+        }
+        defer { MockSSEURLProtocol.handler = nil }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockSSEURLProtocol.self]
+
+        let model = OpenAILanguageModel(
+            baseURL: baseURL,
+            apiKey: "test-key",
+            model: "gpt-test",
+            apiVariant: .responses,
+            session: URLSession(configuration: config)
+        )
+        let session = LanguageModelSession(model: model, tools: [WeatherTool()])
+
+        // Consume the stream fully so wrapStream appends to transcript
+        for try await _ in session.streamResponse(to: "Seattle weather?") {}
+
+        // Wait briefly for MainActor transcript updates
+        try await Task.sleep(for: .milliseconds(50))
+
+        let transcript = session.transcript
+        var entryTypes: [String] = []
+        for entry in transcript {
+            switch entry {
+            case .prompt: entryTypes.append("prompt")
+            case .response: entryTypes.append("response")
+            case .toolCalls: entryTypes.append("toolCalls")
+            case .toolOutput: entryTypes.append("toolOutput")
+            default: break
+            }
+        }
+
+        // Transcript should contain: prompt, toolCalls, toolOutput, response (in that order)
+        #expect(entryTypes.contains("prompt"))
+        #expect(entryTypes.contains("toolCalls"))
+        #expect(entryTypes.contains("toolOutput"))
+        #expect(entryTypes.contains("response"))
+
+        // Verify ordering: toolCalls and toolOutput come before response
+        if let toolCallsIndex = entryTypes.firstIndex(of: "toolCalls"),
+            let toolOutputIndex = entryTypes.firstIndex(of: "toolOutput"),
+            let responseIndex = entryTypes.firstIndex(of: "response")
+        {
+            #expect(toolCallsIndex < responseIndex)
+            #expect(toolOutputIndex < responseIndex)
+        } else {
+            Issue.record("Expected toolCalls, toolOutput, and response in transcript")
+        }
+    }
+
+    // MARK: - Intermediate streaming snapshots during tool loop
+
+    @Test func intermediateSnapshotsYieldedDuringToolLoop() async throws {
+        var requestCount = 0
+        MockSSEURLProtocol.handler = { request in
+            defer { requestCount += 1 }
+            if requestCount == 0 {
+                return [
+                    sseEvent(
+                        #"{"id":"evt_1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"getWeather","arguments":"{\"city\":\"Chicago\"}"}}]},"finish_reason":null}]}"#
+                    ),
+                    sseEvent(#"{"id":"evt_1","choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#),
+                ]
+            } else {
+                return [
+                    sseEvent(
+                        #"{"id":"evt_2","choices":[{"delta":{"content":"Chicago"},"finish_reason":null}]}"#
+                    ),
+                    sseEvent(
+                        #"{"id":"evt_2","choices":[{"delta":{"content":" is windy."},"finish_reason":null}]}"#
+                    ),
+                    sseEvent(#"{"id":"evt_2","choices":[{"delta":{},"finish_reason":"stop"}]}"#),
+                ]
+            }
+        }
+        defer { MockSSEURLProtocol.handler = nil }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockSSEURLProtocol.self]
+
+        let model = OpenAILanguageModel(
+            baseURL: baseURL,
+            apiKey: "test-key",
+            model: "gpt-test",
+            apiVariant: .chatCompletions,
+            session: URLSession(configuration: config)
+        )
+        let session = LanguageModelSession(model: model, tools: [WeatherTool()])
+
+        var snapshots: [LanguageModelSession.ResponseStream<String>.Snapshot] = []
+        for try await snapshot in session.streamResponse(to: "Chicago weather?") {
+            snapshots.append(snapshot)
+        }
+
+        // We should see snapshots:
+        // 1. After tool resolution (yielded with empty text + tool entries) — this is the intermediate snapshot
+        // 2. "Chicago" text from continuation
+        // 3. "Chicago is windy." text from continuation
+        // 4. Final snapshot
+        #expect(snapshots.count >= 3)
+
+        // The intermediate snapshot (yielded after tool resolution, before continuation text) should have tool entries
+        let snapshotsWithToolEntries = snapshots.filter { !$0.transcriptEntries.isEmpty }
+        #expect(!snapshotsWithToolEntries.isEmpty)
+
+        // The first snapshot with tool entries should have been yielded before the final text
+        if let firstToolSnapshot = snapshotsWithToolEntries.first {
+            var hasToolCalls = false
+            var hasToolOutput = false
+            for entry in firstToolSnapshot.transcriptEntries {
+                if case .toolCalls = entry { hasToolCalls = true }
+                if case .toolOutput = entry { hasToolOutput = true }
+            }
+            #expect(hasToolCalls)
+            #expect(hasToolOutput)
+        }
+
+        // Final snapshot should have the complete text
+        let final = snapshots.last!
+        #expect(final.rawContent.jsonString.contains("Chicago is windy."))
+    }
+
+    // MARK: - Responses API: multiple parallel tool calls
+
+    @Test func responsesMultipleParallelToolCalls() async throws {
+        var requestCount = 0
+        MockSSEURLProtocol.handler = { request in
+            defer { requestCount += 1 }
+            if requestCount == 0 {
+                return [
+                    sseEvent(
+                        #"{"type":"response.tool_call.created","tool_call":{"id":"call_1","type":"function","function":{"name":"getWeather","arguments":""}}}"#
+                    ),
+                    sseEvent(
+                        #"{"type":"response.tool_call.delta","tool_call":{"id":"call_1","function":{"arguments":"{\"city\":\"Paris\"}"}}}"#
+                    ),
+                    sseEvent(
+                        #"{"type":"response.tool_call.created","tool_call":{"id":"call_2","type":"function","function":{"name":"getWeather","arguments":""}}}"#
+                    ),
+                    sseEvent(
+                        #"{"type":"response.tool_call.delta","tool_call":{"id":"call_2","function":{"arguments":"{\"city\":\"Berlin\"}"}}}"#
+                    ),
+                    sseEvent(#"{"type":"response.completed","finish_reason":"tool_calls"}"#),
+                ]
+            } else {
+                return [
+                    sseEvent(
+                        #"{"type":"response.output_text.delta","delta":"Paris and Berlin are both lovely."}"#
+                    ),
+                    sseEvent(#"{"type":"response.completed","finish_reason":"stop"}"#),
+                ]
+            }
+        }
+        defer { MockSSEURLProtocol.handler = nil }
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockSSEURLProtocol.self]
+
+        let model = OpenAILanguageModel(
+            baseURL: baseURL,
+            apiKey: "test-key",
+            model: "gpt-test",
+            apiVariant: .responses,
+            session: URLSession(configuration: config)
+        )
+        let session = LanguageModelSession(model: model, tools: [WeatherTool()])
+
+        let response = try await session.streamResponse(
+            to: "Weather in Paris and Berlin?"
+        ).collect()
+
+        #expect(requestCount == 2)
+        #expect(response.content.contains("Paris"))
+        #expect(response.content.contains("Berlin"))
+
+        var toolCallEntries: [Transcript.ToolCalls] = []
+        var toolOutputEntries: [Transcript.ToolOutput] = []
+        for entry in response.transcriptEntries {
+            if case .toolCalls(let calls) = entry { toolCallEntries.append(calls) }
+            if case .toolOutput(let output) = entry { toolOutputEntries.append(output) }
+        }
+        #expect(toolCallEntries.count == 1)
+        #expect(toolCallEntries.first!.count == 2)
+        #expect(toolOutputEntries.count == 2)
+    }
+}
+
+// MARK: - Mock SSE URLProtocol
+
+private func sseEvent(_ json: String) -> String {
+    "data: \(json)\n\n"
+}
+
+private final class MockSSEURLProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var handler: ((URLRequest) -> [String])?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let handler = MockSSEURLProtocol.handler else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+
+        let events = handler(request)
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: nil,
+            headerFields: ["Content-Type": "text/event-stream"]
+        )!
+
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+
+        let payload = events.joined()
+        if let data = payload.data(using: .utf8) {
+            client?.urlProtocol(self, didLoad: data)
+        }
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+// MARK: - Test Delegates
+
+private final class StopDelegate: ToolExecutionDelegate {
+    func toolCallDecision(
+        for toolCall: Transcript.ToolCall,
+        in session: LanguageModelSession
+    ) async -> ToolExecutionDecision {
+        .stop
+    }
+}
+
+private final class ProvideOutputDelegate: ToolExecutionDelegate {
+    let outputSegments: [Transcript.Segment]
+
+    init(output: [Transcript.Segment]) {
+        self.outputSegments = output
+    }
+
+    func toolCallDecision(
+        for toolCall: Transcript.ToolCall,
+        in session: LanguageModelSession
+    ) async -> ToolExecutionDecision {
+        .provideOutput(outputSegments)
+    }
+}
