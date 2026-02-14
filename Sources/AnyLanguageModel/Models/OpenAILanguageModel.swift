@@ -692,11 +692,12 @@ public struct OpenAILanguageModel: LanguageModel {
             let stream: AsyncThrowingStream<LanguageModelSession.ResponseStream<Content>.Snapshot, any Error> = .init {
                 continuation in
                 let task = Task { @Sendable in
+                    defer { continuation.finish() }
                     do {
                         var currentMessages = initialMessages
                         var transcriptEntries: [Transcript.Entry] = []
 
-                        while true {
+                        toolLoop: while true {
                             let params = try Responses.createRequestBody(
                                 model: model,
                                 messages: currentMessages,
@@ -746,21 +747,23 @@ public struct OpenAILanguageModel: LanguageModel {
 
                             let toolCalls = toolCallAccumulator.build()
 
-                            if !toolCalls.isEmpty {
-                                if let assistantRaw = makeAssistantToolCallMessage(
-                                    for: .responses,
-                                    toolCalls: toolCalls
-                                ) {
-                                    currentMessages.append(
-                                        OpenAIMessage(role: .raw(rawContent: assistantRaw), content: .text(""))
-                                    )
-                                }
-                                let resolution = try await resolveToolCalls(toolCalls, session: session)
-                                switch resolution {
-                                case .stop(let calls):
-                                    if !calls.isEmpty {
-                                        transcriptEntries.append(.toolCalls(Transcript.ToolCalls(calls)))
-                                    }
+                            let action = try await handleStreamingToolResolution(
+                                toolCalls: toolCalls,
+                                hasToolCallsFinishReason: !toolCalls.isEmpty,
+                                apiVariant: .responses,
+                                session: session,
+                                type: type,
+                                accumulatedText: accumulatedText,
+                                transcriptEntries: &transcriptEntries,
+                                currentMessages: &currentMessages,
+                                continuation: continuation
+                            )
+
+                            switch action {
+                            case .continue:
+                                continue toolLoop
+                            case .break:
+                                if !accumulatedText.isEmpty {
                                     if let snapshot = makeStreamingSnapshot(
                                         type: type,
                                         accumulatedText: accumulatedText,
@@ -768,50 +771,10 @@ public struct OpenAILanguageModel: LanguageModel {
                                     ) {
                                         continuation.yield(snapshot)
                                     }
-                                    break
-                                case .invocations(let invocations):
-                                    if !invocations.isEmpty {
-                                        transcriptEntries.append(
-                                            .toolCalls(Transcript.ToolCalls(invocations.map { $0.call }))
-                                        )
-                                        for invocation in invocations {
-                                            let output = invocation.output
-                                            transcriptEntries.append(.toolOutput(output))
-                                            currentMessages.append(
-                                                OpenAIMessage(
-                                                    role: .tool(id: invocation.call.id),
-                                                    content: .text(convertSegmentsToToolContentString(output.segments))
-                                                )
-                                            )
-                                        }
-
-                                        if let snapshot = makeStreamingSnapshot(
-                                            type: type,
-                                            accumulatedText: accumulatedText,
-                                            transcriptEntries: transcriptEntries
-                                        ) {
-                                            continuation.yield(snapshot)
-                                        }
-                                        continue
-                                    }
                                 }
+                                break toolLoop
                             }
-
-                            // Yield a final snapshot if we have content
-                            if !accumulatedText.isEmpty {
-                                if let snapshot = makeStreamingSnapshot(
-                                    type: type,
-                                    accumulatedText: accumulatedText,
-                                    transcriptEntries: transcriptEntries
-                                ) {
-                                    continuation.yield(snapshot)
-                                }
-                            }
-
-                            break
                         }
-
-                        continuation.finish()
                     } catch {
                         continuation.finish(throwing: error)
                     }
@@ -828,11 +791,12 @@ public struct OpenAILanguageModel: LanguageModel {
             let stream: AsyncThrowingStream<LanguageModelSession.ResponseStream<Content>.Snapshot, any Error> = .init {
                 continuation in
                 let task = Task { @Sendable in
+                    defer { continuation.finish() }
                     do {
                         var currentMessages = initialMessages
                         var transcriptEntries: [Transcript.Entry] = []
 
-                        while true {
+                        toolLoop: while true {
                             let params = try ChatCompletions.createRequestBody(
                                 model: model,
                                 messages: currentMessages,
@@ -892,24 +856,24 @@ public struct OpenAILanguageModel: LanguageModel {
                             }
 
                             let toolCalls = toolCallAccumulator.build()
-                            if !toolCalls.isEmpty || finishReason == "tool_calls" {
-                                if let assistantRaw = makeAssistantToolCallMessage(
-                                    for: .chatCompletions,
-                                    toolCalls: toolCalls
-                                ) {
-                                    currentMessages.append(
-                                        OpenAIMessage(role: .raw(rawContent: assistantRaw), content: .text(""))
-                                    )
-                                }
 
-                                guard !toolCalls.isEmpty else { break }
+                            let action = try await handleStreamingToolResolution(
+                                toolCalls: toolCalls,
+                                hasToolCallsFinishReason: !toolCalls.isEmpty || finishReason == "tool_calls",
+                                apiVariant: .chatCompletions,
+                                session: session,
+                                type: type,
+                                accumulatedText: accumulatedText,
+                                transcriptEntries: &transcriptEntries,
+                                currentMessages: &currentMessages,
+                                continuation: continuation
+                            )
 
-                                let resolution = try await resolveToolCalls(toolCalls, session: session)
-                                switch resolution {
-                                case .stop(let calls):
-                                    if !calls.isEmpty {
-                                        transcriptEntries.append(.toolCalls(Transcript.ToolCalls(calls)))
-                                    }
+                            switch action {
+                            case .continue:
+                                continue toolLoop
+                            case .break:
+                                if !accumulatedText.isEmpty {
                                     if let snapshot = makeStreamingSnapshot(
                                         type: type,
                                         accumulatedText: accumulatedText,
@@ -917,50 +881,10 @@ public struct OpenAILanguageModel: LanguageModel {
                                     ) {
                                         continuation.yield(snapshot)
                                     }
-                                    break
-                                case .invocations(let invocations):
-                                    if !invocations.isEmpty {
-                                        transcriptEntries.append(
-                                            .toolCalls(Transcript.ToolCalls(invocations.map { $0.call }))
-                                        )
-                                        for invocation in invocations {
-                                            let output = invocation.output
-                                            transcriptEntries.append(.toolOutput(output))
-                                            currentMessages.append(
-                                                OpenAIMessage(
-                                                    role: .tool(id: invocation.call.id),
-                                                    content: .text(convertSegmentsToToolContentString(output.segments))
-                                                )
-                                            )
-                                        }
-
-                                        if let snapshot = makeStreamingSnapshot(
-                                            type: type,
-                                            accumulatedText: accumulatedText,
-                                            transcriptEntries: transcriptEntries
-                                        ) {
-                                            continuation.yield(snapshot)
-                                        }
-                                        continue
-                                    }
                                 }
+                                break toolLoop
                             }
-
-                            // Yield a final snapshot if we have content
-                            if !accumulatedText.isEmpty {
-                                if let snapshot = makeStreamingSnapshot(
-                                    type: type,
-                                    accumulatedText: accumulatedText,
-                                    transcriptEntries: transcriptEntries
-                                ) {
-                                    continuation.yield(snapshot)
-                                }
-                            }
-
-                            break
                         }
-
-                        continuation.finish()
                     } catch {
                         continuation.finish(throwing: error)
                     }
@@ -1820,6 +1744,77 @@ private func makeAssistantToolCallMessage(
             "role": .string("assistant"),
             "content": .array(content),
         ])
+    }
+}
+
+private enum StreamingToolAction {
+    case `continue`
+    case `break`
+}
+
+/// Shared handler for tool resolution during streaming. Both API variants call this
+/// after consuming their event stream. It resolves tool calls, appends transcript entries,
+/// appends tool result messages, yields intermediate snapshots, and returns whether
+/// the streaming loop should continue (more tool calls to process) or break.
+private func handleStreamingToolResolution<Content: Generable>(
+    toolCalls: [OpenAIToolCall],
+    hasToolCallsFinishReason: Bool,
+    apiVariant: OpenAILanguageModel.APIVariant,
+    session: LanguageModelSession,
+    type: Content.Type,
+    accumulatedText: String,
+    transcriptEntries: inout [Transcript.Entry],
+    currentMessages: inout [OpenAIMessage],
+    continuation: AsyncThrowingStream<LanguageModelSession.ResponseStream<Content>.Snapshot, any Error>.Continuation
+) async throws -> StreamingToolAction {
+    guard !toolCalls.isEmpty || hasToolCallsFinishReason else {
+        return .break
+    }
+
+    if let assistantRaw = makeAssistantToolCallMessage(for: apiVariant, toolCalls: toolCalls) {
+        currentMessages.append(OpenAIMessage(role: .raw(rawContent: assistantRaw), content: .text("")))
+    }
+
+    guard !toolCalls.isEmpty else { return .break }
+
+    let resolution = try await resolveToolCalls(toolCalls, session: session)
+    switch resolution {
+    case .stop(let calls):
+        if !calls.isEmpty {
+            transcriptEntries.append(.toolCalls(Transcript.ToolCalls(calls)))
+        }
+        if let snapshot = makeStreamingSnapshot(
+            type: type,
+            accumulatedText: accumulatedText,
+            transcriptEntries: transcriptEntries
+        ) {
+            continuation.yield(snapshot)
+        }
+        return .break
+
+    case .invocations(let invocations):
+        guard !invocations.isEmpty else { return .break }
+
+        transcriptEntries.append(.toolCalls(Transcript.ToolCalls(invocations.map { $0.call })))
+        for invocation in invocations {
+            let output = invocation.output
+            transcriptEntries.append(.toolOutput(output))
+            currentMessages.append(
+                OpenAIMessage(
+                    role: .tool(id: invocation.call.id),
+                    content: .text(convertSegmentsToToolContentString(output.segments))
+                )
+            )
+        }
+
+        if let snapshot = makeStreamingSnapshot(
+            type: type,
+            accumulatedText: accumulatedText,
+            transcriptEntries: transcriptEntries
+        ) {
+            continuation.yield(snapshot)
+        }
+        return .continue
     }
 }
 
