@@ -1,12 +1,11 @@
 import Foundation
 import Observation
-import os
 
 @Observable
 public final class LanguageModelSession: @unchecked Sendable {
-    public var isResponding: Bool { state.withLock { $0.isResponding } }
-    public var transcript: Transcript { state.withLock { $0.transcript } }
-    @ObservationIgnored private let state: OSAllocatedUnfairLock<State>
+    public var isResponding: Bool { state.access { $0.isResponding } }
+    public var transcript: Transcript { state.access { $0.transcript } }
+    @ObservationIgnored private let state: Locked<State>
 
     private let model: any LanguageModel
     public let tools: [any Tool]
@@ -84,7 +83,7 @@ public final class LanguageModelSession: @unchecked Sendable {
             }
         }
 
-        self.state = .init(initialState: .init(finalTranscript))
+        self.state = .init(.init(finalTranscript))
     }
 
     public func prewarm(promptPrefix: Prompt? = nil) {
@@ -92,11 +91,11 @@ public final class LanguageModelSession: @unchecked Sendable {
     }
 
     nonisolated private func beginResponding() {
-        state.withLock { $0.beginResponding() }
+        state.access { $0.beginResponding() }
     }
 
     nonisolated private func endResponding() {
-        state.withLock { $0.endResponding() }
+        state.access { $0.endResponding() }
     }
 
     nonisolated private func wrapRespond<T>(_ operation: () async throws -> T) async throws -> T {
@@ -144,7 +143,7 @@ public final class LanguageModelSession: @unchecked Sendable {
                                 segments: [.text(.init(content: textContent))]
                             )
                         )
-                        session.state.withLock { $0.transcript.append(responseEntry) }
+                        session.state.access { $0.transcript.append(responseEntry) }
                     }
                 } catch {
                     continuation.finish(throwing: error)
@@ -192,7 +191,7 @@ public final class LanguageModelSession: @unchecked Sendable {
                     responseFormat: nil
                 )
             )
-            state.withLock { $0.transcript.append(promptEntry) }
+            state.access { $0.transcript.append(promptEntry) }
 
             let response = try await model.respond(
                 within: self,
@@ -218,7 +217,7 @@ public final class LanguageModelSession: @unchecked Sendable {
             )
 
             // Add tool entries and response to transcript
-            state.withLock { state in
+            state.access { state in
                 state.transcript.append(contentsOf: response.transcriptEntries)
                 state.transcript.append(responseEntry)
             }
@@ -241,7 +240,7 @@ public final class LanguageModelSession: @unchecked Sendable {
                 responseFormat: nil
             )
         )
-        state.withLock { $0.transcript.append(promptEntry) }
+        state.access { $0.transcript.append(promptEntry) }
 
         return wrapStream(
             model.streamResponse(
@@ -535,7 +534,7 @@ extension LanguageModelSession {
                     responseFormat: nil
                 )
             )
-            state.withLock { $0.transcript.append(promptEntry) }
+            state.access { $0.transcript.append(promptEntry) }
 
             // Extract text content for the Prompt parameter
             let textPrompt = Prompt(prompt)
@@ -564,7 +563,7 @@ extension LanguageModelSession {
             )
 
             // Add tool entries and response to transcript
-            state.withLock { state in
+            state.access { state in
                 state.transcript.append(contentsOf: response.transcriptEntries)
                 state.transcript.append(responseEntry)
             }
@@ -637,7 +636,7 @@ extension LanguageModelSession {
                 responseFormat: nil
             )
         )
-        state.withLock { $0.transcript.append(promptEntry) }
+        state.access { $0.transcript.append(promptEntry) }
 
         // Extract text content for the Prompt parameter
         let textPrompt = Prompt(prompt)
